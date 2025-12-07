@@ -81,10 +81,6 @@ class PhysicsSceneBuilder {
                 data.x = body.position.x;
                 data.z = body.position.y; // Map visual Y to Z
                 // y remains unchanged
-                // Angle in top view usually represents rotation around Y axis (which is Z in top view? No)
-                // Side View Angle: Rotation around Z axis (in 3D).
-                // Top View Angle: Rotation around Y axis (in 3D).
-                // Currently we only support 2D rotation. Let's assume angle is strictly for the current plane.
                 data.angleTop = body.angle; 
             }
         });
@@ -233,6 +229,7 @@ class PhysicsSceneBuilder {
                     return;
                 }
             }
+            console.warn(`[PhysicsEngine.updateObject] No data found for ${id}`);
             return;
         }
 
@@ -269,6 +266,8 @@ class PhysicsSceneBuilder {
                 if (updates.restitution !== undefined) body.restitution = updates.restitution;
                 if (updates.color !== undefined) body.render.fillStyle = updates.color;
             }
+        } else {
+             console.warn(`[PhysicsEngine.updateObject] No body found for ${id}`);
         }
     }
 
@@ -437,7 +436,68 @@ class PhysicsSceneBuilder {
         return ropeData;
     }
 
-    // ... (Pulley and Conveyor need similar updates to store IDs and Data, skipping for brevity in this first pass of Core Refactor)
+    /**
+     * 创建滑轮组 (Pulley)
+     */
+    createPulley(id, params) {
+        const { bodyAId, bodyBId, pointA, pointB, pointC, pointD, stiffness = 1, length, isLight = true, mass } = params;
+        
+        // Pulley usually involves 2 bodies and 2 fixed points (or body anchor points).
+        // Let's assume structure: BodyA --- PointA (Pulley1) --- PointB (Pulley2) --- BodyB
+        // Length = |BodyA-PointA| + |BodyB-PointB|
+        
+        // If length is not provided, calculate current length
+        let totalLength = length;
+        if (!totalLength) {
+             // Need positions... tricky if bodies not created yet or just IDs passed.
+             // We can defer length calculation to first update if needed, but better to have it.
+             // For now, assume user provides length or we calculate if bodies exist.
+             totalLength = 200; // Default fallback
+        }
+
+        const pulleyData = {
+            id,
+            type: 'pulley',
+            bodyAId, bodyBId,
+            pointA: pointA || { x: -50, y: -100 }, // Anchor on Body A (or world)
+            pointB: pointB || { x: 50, y: -100 },  // Anchor on Body B (or world)
+            pointC: pointC || { x: -50, y: -200 }, // Fixed Pulley 1
+            pointD: pointD || { x: 50, y: -200 },  // Fixed Pulley 2
+            length: totalLength,
+            stiffness, isLight, mass,
+            style: { strokeStyle: '#8e44ad', lineWidth: 2 }
+        };
+
+        if (!this.customConstraints) this.customConstraints = [];
+        this.customConstraints.push(pulleyData);
+        return pulleyData;
+    }
+
+    /**
+     * 获取当前场景状态 (Snapshot)
+     */
+    getState() {
+        return {
+            sceneData: JSON.parse(JSON.stringify(this.sceneData)),
+            customConstraints: JSON.parse(JSON.stringify(this.customConstraints || [])),
+            gravity: { ...this.engine.world.gravity }
+        };
+    }
+
+    /**
+     * 恢复场景状态
+     */
+    restoreState(state) {
+        if (!state) return;
+        this.clear();
+        this.sceneData = state.sceneData || {};
+        this.customConstraints = state.customConstraints || [];
+        if (state.gravity) {
+            this.engine.world.gravity.y = state.gravity.y;
+            this.engine.world.gravity.x = state.gravity.x;
+        }
+        this.rebuildWorld();
+    }
 
     /**
      * 切割物体 (Cut Object)
@@ -639,8 +699,9 @@ class PhysicsSceneBuilder {
                             this._solveIdealRope(rope);
                         } else if (cons.type === 'spring') {
                             this._solveSpring(rope);
+                        } else if (cons.type === 'pulley') {
+                            this._solveIdealPulley(rope);
                         }
-                        // Pulley skipped for now
                     });
                 }
             }
@@ -821,9 +882,53 @@ class PhysicsSceneBuilder {
         }
     }
     
-    // Pulley implementation omitted for this refactor step to ensure core stability first
     _solveIdealPulley(pulley) {
-        // Placeholder
+        // Pulley Constraint:
+        // Length = |BodyA - PointC| + |BodyB - PointD| = Constant
+        // (Assuming PointA/B are anchors on bodies, PointC/D are fixed pulleys)
+        
+        // Resolve bodies
+        const bodyA = pulley.bodyA;
+        const bodyB = pulley.bodyB;
+        if (!bodyA || !bodyB) return;
+
+        // Anchor points on bodies (world coords)
+        const anchorA = Vector.add(bodyA.position, pulley.pointA);
+        const anchorB = Vector.add(bodyB.position, pulley.pointB);
+        
+        // Fixed pulley points (world coords)
+        const pulleyA = pulley.pointC;
+        const pulleyB = pulley.pointD;
+
+        // Vectors
+        const vecA = Vector.sub(anchorA, pulleyA);
+        const vecB = Vector.sub(anchorB, pulleyB);
+        
+        const lenA = Vector.magnitude(vecA);
+        const lenB = Vector.magnitude(vecB);
+        const currentLen = lenA + lenB;
+        
+        if (currentLen > pulley.length) {
+            const diff = currentLen - pulley.length;
+            
+            // Directions (towards pulleys)
+            const dirA = Vector.normalise(Vector.neg(vecA));
+            const dirB = Vector.normalise(Vector.neg(vecB));
+            
+            // Forces
+            // Tension is uniform in ideal pulley
+            // F = k * diff (if elastic/soft) or positional correction
+            // Let's use simple stiff spring-like correction for stability
+            const k = pulley.stiffness || 0.5;
+            const tension = diff * k;
+            
+            if (!bodyA.isStatic) {
+                Matter.Body.applyForce(bodyA, anchorA, Vector.mult(dirA, tension));
+            }
+            if (!bodyB.isStatic) {
+                Matter.Body.applyForce(bodyB, anchorB, Vector.mult(dirB, tension));
+            }
+        }
     }
 }
 

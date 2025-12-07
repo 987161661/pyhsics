@@ -5,8 +5,9 @@ import {
   Play, Pause, RotateCcw, Square, Circle as CircleIcon, MousePointer, 
   Move, Settings, Box, Link, ArrowRight, Triangle, ArrowDown, Minus, 
   ChevronDown, ChevronRight, Hexagon, FastForward, RotateCw, Maximize, 
-  Activity, Cone, Grid, Layers, Monitor, Scissors
+  Activity, Cone, Grid, Layers, Monitor, Scissors, Save, Upload, Undo2, Redo2, Anchor
 } from 'lucide-react';
+import { Shape } from 'react-konva';
 import PhysicsSceneBuilder from './utils/PhysicsEngine';
 
 // --- UI Components ---
@@ -48,6 +49,91 @@ const ToolButton = ({ icon, active, onClick, tooltip, disabled }) => (
   </button>
 );
 
+const SpringShape = ({ points, stroke, strokeWidth, tension = 0.5 }) => {
+  return (
+    <Shape
+      sceneFunc={(context, shape) => {
+        context.beginPath();
+        const [x1, y1, x2, y2] = points;
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const len = Math.sqrt(dx*dx + dy*dy);
+        const angle = Math.atan2(dy, dx);
+        
+        context.translate(x1, y1);
+        context.rotate(angle);
+        
+        const coils = 12;
+        const width = 10;
+        
+        context.moveTo(0, 0);
+        for (let i = 0; i <= coils; i++) {
+            const x = (len * i) / coils;
+            const y = i % 2 === 0 ? 0 : (i % 4 === 1 ? -width : width);
+            // Smoother sine-like wave or zigzag
+            // Let's do zigzag for spring
+            context.lineTo(x, (i === 0 || i === coils) ? 0 : (i % 2 === 1 ? -width : width));
+        }
+        context.lineTo(len, 0);
+        
+        context.restore(); // This handles un-rotate/un-translate? No, sceneFunc doesn't auto-restore context state changes unless save/restore used.
+        // But Konva handles transforms usually. Here we are doing manual transform on context.
+        // It's safer to not modify context transform if possible or save/restore.
+        // Actually context provided by Konva is already transformed to the Shape's x,y.
+        // But we are passing points in world/parent coords.
+        // So we should NOT rely on Shape x,y if we draw from 0,0 to len.
+        // We should just use absolute points if we didn't translate.
+        // But rotating is easier with translate.
+        // Let's use simple drawing without rotate.
+      }}
+      stroke={stroke}
+      strokeWidth={strokeWidth}
+      hitStrokeWidth={10}
+    />
+  );
+};
+
+// Re-implementing SpringShape to be simpler and safer
+const ZigzagLine = ({ points, stroke, strokeWidth, ...props }) => {
+    return (
+        <Shape
+            {...props}
+            sceneFunc={(ctx, shape) => {
+                const [x1, y1, x2, y2] = points;
+                const dx = x2 - x1;
+                const dy = y2 - y1;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                
+                ctx.beginPath();
+                ctx.moveTo(x1, y1);
+                
+                const coils = 10;
+                const amp = 8;
+                const step = dist / coils;
+                
+                // Normal vector
+                const nx = -dy / dist;
+                const ny = dx / dist;
+                
+                for (let i = 1; i < coils; i++) {
+                    const t = i / coils;
+                    const x = x1 + dx * t;
+                    const y = y1 + dy * t;
+                    
+                    const offset = (i % 2 === 0 ? 1 : -1) * amp;
+                    ctx.lineTo(x + nx * offset, y + ny * offset);
+                }
+                
+                ctx.lineTo(x2, y2);
+                ctx.fillStrokeShape(shape);
+            }}
+            stroke={stroke}
+            strokeWidth={strokeWidth}
+            hitStrokeWidth={15}
+        />
+    );
+};
+
 // --- Main Editor ---
 
 const PhysicsEditor = () => {
@@ -73,6 +159,9 @@ const PhysicsEditor = () => {
   const [connectionStart, setConnectionStart] = useState(null); 
   const [cutStart, setCutStart] = useState(null);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+  const [history, setHistory] = useState([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const [snapLines, setSnapLines] = useState([]);
   const stageRef = useRef(null);
   const renderRef = useRef(null);
   const dragRef = useRef({ activeId: null, startX: 0, startY: 0, startAngle: 0, startWidth: 0, startHeight: 0, startRadius: 0 });
@@ -80,11 +169,155 @@ const PhysicsEditor = () => {
   const GRID_SIZE = 50;
   const snap = (val) => snapToGrid ? Math.round(val / GRID_SIZE) * GRID_SIZE : val;
 
+  // Snapping Logic
+  const getSnapPosition = (activeId, x, y, activeW = null, activeH = null) => {
+      // Resolve dimensions
+      let w = activeW;
+      let h = activeH;
+
+      if (activeId && (!w || !h)) {
+          const activeData = builder.sceneData[activeId];
+          if (!activeData) return { x, y, lines: [] };
+          w = activeData.width || (activeData.radius * 2) || 50;
+          h = activeData.height || (activeData.radius * 2) || 50;
+      }
+
+      // If still no dimensions (e.g. creating new object without passing dims), default to 50
+      if (!w) w = 50;
+      if (!h) h = 50;
+      
+      const left = x - w/2;
+      const right = x + w/2;
+      const top = y - h/2;
+      const bottom = y + h/2;
+
+      let snappedX = x;
+      let snappedY = y;
+      const lines = [];
+      const threshold = 10;
+
+      // Iterate through other objects
+      Object.keys(builder.sceneData).forEach(id => {
+          if (id === activeId) return;
+          const target = builder.sceneData[id];
+          // Get target view coordinates
+          let targetX = target.x;
+          let targetY = viewMode === 'side' ? target.y : target.z;
+          
+          let tw = target.width || (target.radius * 2) || 50;
+          let th = target.height || (target.radius * 2) || 50;
+          
+          const tLeft = targetX - tw/2;
+          const tRight = targetX + tw/2;
+          const tTop = targetY - th/2;
+          const tBottom = targetY + th/2;
+
+          // X Snapping
+          // Snap Left to Right
+          if (Math.abs(left - tRight) < threshold) {
+              snappedX = tRight + w/2;
+              lines.push([tRight, tTop, tRight, tBottom]); // Visual guide
+          }
+          // Snap Right to Left
+          if (Math.abs(right - tLeft) < threshold) {
+              snappedX = tLeft - w/2;
+              lines.push([tLeft, tTop, tLeft, tBottom]);
+          }
+          // Snap Center to Center
+          if (Math.abs(x - targetX) < threshold) {
+              snappedX = targetX;
+              lines.push([targetX, tTop, targetX, tBottom]);
+          }
+
+          // Y Snapping
+          // Snap Top to Bottom
+          if (Math.abs(top - tBottom) < threshold) {
+              snappedY = tBottom + h/2;
+              lines.push([tLeft, tBottom, tRight, tBottom]);
+          }
+          // Snap Bottom to Top
+          if (Math.abs(bottom - tTop) < threshold) {
+              snappedY = tTop - h/2;
+              lines.push([tLeft, tTop, tRight, tTop]);
+          }
+           // Snap Center to Center
+           if (Math.abs(y - targetY) < threshold) {
+              snappedY = targetY;
+              lines.push([tLeft, targetY, tRight, targetY]);
+          }
+      });
+
+      return { x: snappedX, y: snappedY, lines };
+  };
+
+  // History Management
+  const pushHistory = () => {
+    const state = builder.getState();
+    const newHistory = history.slice(0, historyIndex + 1);
+    newHistory.push(state);
+    if (newHistory.length > 20) newHistory.shift(); // Limit history size
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+  };
+
+  const handleUndo = () => {
+    if (historyIndex > 0) {
+        const prevIndex = historyIndex - 1;
+        const state = history[prevIndex];
+        builder.restoreState(state);
+        setHistoryIndex(prevIndex);
+        setVersion(v => v + 1);
+    }
+  };
+
+  const handleRedo = () => {
+    if (historyIndex < history.length - 1) {
+        const nextIndex = historyIndex + 1;
+        const state = history[nextIndex];
+        builder.restoreState(state);
+        setHistoryIndex(nextIndex);
+        setVersion(v => v + 1);
+    }
+  };
+
+  const handleSave = () => {
+      const state = builder.getState();
+      const blob = new Blob([JSON.stringify(state)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `physics-scene-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+  };
+
+  const handleLoad = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (event) => {
+          try {
+              const state = JSON.parse(event.target.result);
+              builder.restoreState(state);
+              pushHistory(); // Add loaded state to history
+              setVersion(v => v + 1);
+          } catch (err) {
+              alert('Failed to load file');
+          }
+      };
+      reader.readAsText(file);
+  };
+
   // View Mode Sync
   useEffect(() => {
     builder.setViewMode(viewMode);
     setVersion(v => v + 1);
   }, [viewMode, builder]);
+
+  // Init History
+  useEffect(() => {
+      if (history.length === 0) pushHistory();
+  }, []);
 
   // Deletion
   useEffect(() => {
@@ -93,11 +326,21 @@ const PhysicsEditor = () => {
         builder.removeObject(selectedId);
         setSelectedId(null);
         setVersion(v => v + 1);
+        pushHistory();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) handleRedo();
+          else handleUndo();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
+          e.preventDefault();
+          handleRedo();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedId, builder]);
+  }, [selectedId, builder, history, historyIndex]);
 
   // Loop
   useEffect(() => {
@@ -139,6 +382,17 @@ const PhysicsEditor = () => {
                 const posA = cons.bodyA ? Matter.Vector.add(cons.bodyA.position, cons.pointA) : cons.pointA;
                 const posB = cons.bodyB ? Matter.Vector.add(cons.bodyB.position, cons.pointB) : cons.pointB;
                 newConstraints.push({ id: cons.id, type: 'spring', points: [posA.x, posA.y, posB.x, posB.y], color: '#27ae60', dash: [10, 5] });
+            } else if (cons.type === 'pulley') {
+                const posA = cons.bodyA ? Matter.Vector.add(cons.bodyA.position, cons.pointA) : cons.pointA;
+                const posB = cons.bodyB ? Matter.Vector.add(cons.bodyB.position, cons.pointB) : cons.pointB;
+                const pC = cons.pointC;
+                const pD = cons.pointD;
+                newConstraints.push({ 
+                    id: cons.id, 
+                    type: 'pulley', 
+                    points: [posA.x, posA.y, pC.x, pC.y, pD.x, pD.y, posB.x, posB.y], 
+                    color: '#8e44ad' 
+                });
             }
         });
       }
@@ -172,7 +426,17 @@ const PhysicsEditor = () => {
           if (dragRef.current.activeId) {
               const { activeId, startX, startY, startAngle, startWidth, startHeight, startRadius } = dragRef.current;
               const dx = pointer.x - startX;
-              
+              const dy = pointer.y - startY; // Need dy for movement logic if we change to relative
+
+              if (tool === 'select') { // Assuming dragging logic is implicit for select tool if not strictly separated
+                  // Actually dragRef is set in handleObjectMouseDown, and Stage draggable is false if select.
+                  // But we use Konva draggable for objects usually? 
+                  // Ah, looking at the code, objects have `draggable={tool === 'select'}`.
+                  // So Konva handles the drag visually.
+                  // But we might want to override position if we want to show snapping *during* drag.
+                  // Konva's onDragMove event is better for this.
+              }
+
               if (tool === 'rotate') {
                   const angleChange = dx * (Math.PI / 180);
                   builder.updateObject(activeId, { angle: startAngle + angleChange });
@@ -202,6 +466,7 @@ const PhysicsEditor = () => {
              // So passing stage pointer directly (which matches rendered body positions) is correct.
              builder.cutObject(cutStart, pointer);
              setVersion(v => v + 1);
+             pushHistory();
           }
           setCutStart(null);
       }
@@ -247,8 +512,35 @@ const PhysicsEditor = () => {
     if (!pointer) return;
 
     const id = Date.now().toString();
-    const x = snap(pointer.x);
-    const y = snap(pointer.y);
+
+    // Determine default dimensions for snapping
+    let defaultW = 50;
+    let defaultH = 50;
+    if (tool === 'ground') { defaultW = 200; defaultH = 20; }
+    else if (tool === 'wall') { defaultW = 20; defaultH = 200; }
+    else if (tool === 'ramp') { defaultW = 100; defaultH = 100; }
+    else if (tool === 'conveyor') { defaultW = 150; defaultH = 20; }
+    else if (tool === 'polygon') { defaultW = 60; defaultH = 60; }
+    else if (tool === 'circle' || tool === 'cone') { defaultW = 50; defaultH = 50; }
+
+    // Attempt object snap first
+    const snapResult = getSnapPosition(null, pointer.x, pointer.y, defaultW, defaultH);
+    
+    let x = snapResult.x;
+    let y = snapResult.y;
+
+    // If no significant snap happened, check grid snap
+    const objectSnapped = (Math.abs(x - pointer.x) > 0.1 || Math.abs(y - pointer.y) > 0.1);
+    if (!objectSnapped) {
+        x = snap(pointer.x);
+        y = snap(pointer.y);
+    }
+    
+    // Show snap lines briefly
+    if (snapResult.lines.length > 0) {
+        setSnapLines(snapResult.lines);
+        setTimeout(() => setSnapLines([]), 500);
+    }
     
     const mappedDefaultZ = (window.innerHeight / 2) - defaultPlacementZ;
     const mappedDefaultY = (window.innerHeight / 2) - defaultPlacementY;
@@ -261,7 +553,7 @@ const PhysicsEditor = () => {
         finalZ = y;
     }
 
-    if (tool === 'rope' || tool === 'spring') {
+    if (tool === 'rope' || tool === 'spring' || tool === 'pulley') {
         if (!connectionStart) {
             setConnectionStart({ type: 'point', x: finalX, y: finalY, z: finalZ, viewX: x, viewY: y });
         } else {
@@ -282,11 +574,26 @@ const PhysicsEditor = () => {
 
             if (tool === 'rope') {
                 builder.createIdealRope(id, { bodyAId, bodyBId, pointA, pointB, length: dist || 100 });
-            } else {
+            } else if (tool === 'spring') {
                 builder.createSpring(id, { bodyAId, bodyBId, pointA, pointB, length: dist || 100, stiffness: 0.01, damping: 0.1 });
+            } else if (tool === 'pulley') {
+                 // Create default pulley points above the objects
+                 // In side view, Y is up/down. -200 is up.
+                 const pC = { x: startX, y: startY - 150, z: startZ };
+                 const pD = { x: finalX, y: finalY - 150, z: finalZ };
+                 
+                 // If top view, we can't easily visualize height difference for pulleys unless we assume Z.
+                 // But let's just use the calculated world coords.
+                 builder.createPulley(id, { 
+                    bodyAId, bodyBId, 
+                    pointA, pointB, 
+                    pointC: pC, pointD: pD 
+                 });
             }
+            
             setConnectionStart(null);
             setVersion(v => v + 1);
+            pushHistory();
         }
         return;
     }
@@ -319,23 +626,40 @@ const PhysicsEditor = () => {
        created = true;
     }
     
-    if (created) setVersion(v => v + 1);
+    if (created) {
+        setVersion(v => v + 1);
+        pushHistory();
+    }
   };
 
-  const handleDragEnd = (e, objId) => {
-      const body = Matter.Composite.get(engine.world, objId, 'body');
+  const handleDragEnd = (e, sceneId) => {
+      const body = builder.entities[sceneId];
+      
+      setSnapLines([]); // Clear snap lines
       if (body) {
-          const x = snap(e.target.x());
-          const y = snap(e.target.y());
-          const data = builder.sceneData[objId];
+          const x = e.target.x(); // Already snapped in onDragMove
+          const y = e.target.y();
+
+          // Double check snapping just in case?
+          const { x: finalX, y: finalY } = getSnapPosition(sceneId, x, y);
+
+          const data = builder.sceneData[sceneId];
+
           if (data) {
               if (viewMode === 'side') {
-                  builder.updateObject(objId, { x, y }); 
+                  builder.updateObject(sceneId, { x: finalX, y: finalY }); 
               } else {
-                  builder.updateObject(objId, { x, z: y }); 
+                  builder.updateObject(sceneId, { x: finalX, z: finalY }); 
               }
           }
           Matter.Body.setVelocity(body, { x: 0, y: 0 });
+          // Ensure angular velocity is also reset to prevent spin after "violent" snap
+          Matter.Body.setAngularVelocity(body, 0); 
+          
+          setVersion(v => v + 1);
+          pushHistory();
+      } else {
+          console.warn('[handleDragEnd] Body not found for sceneId:', sceneId);
       }
   };
 
@@ -344,6 +668,8 @@ const PhysicsEditor = () => {
     setObjects([]);
     setConstraints([]);
     setIsRunning(false);
+    setVersion(v => v + 1);
+    pushHistory();
   };
 
   const renderGrid = () => {
@@ -397,11 +723,13 @@ const PhysicsEditor = () => {
         <CollapsibleSection title="连接约束">
              <ToolButton icon={<Link />} active={tool === 'rope'} onClick={() => setTool('rope')} tooltip="绳索" />
              <ToolButton icon={<Activity />} active={tool === 'spring'} onClick={() => setTool('spring')} tooltip="弹簧" />
+             <ToolButton icon={<Anchor />} active={tool === 'pulley'} onClick={() => setTool('pulley')} tooltip="滑轮组" />
          </CollapsibleSection>
       </div>
 
       {/* Main Stage Area */}
       <div className="flex-1 relative z-0 bg-white cursor-crosshair">
+        <input type="file" id="load-file" className="hidden" accept=".json" onChange={handleLoad} />
         <Stage 
           width={window.innerWidth - (256 + 384)} 
           height={window.innerHeight} 
@@ -417,30 +745,50 @@ const PhysicsEditor = () => {
             {snapToGrid && renderGrid()}
             
             {/* Constraints */}
-            {constraints.map((cons, i) => (
-                <Line 
-                    key={cons.id || i} 
-                    points={cons.points} 
-                    stroke={cons.id === selectedId ? '#2563eb' : cons.color} 
-                    strokeWidth={cons.id === selectedId ? 4 : 2} 
-                    dash={cons.dash} 
-                    hitStrokeWidth={10}
-                    onClick={(e) => {
+            {constraints.map((cons, i) => {
+                const isSelected = cons.id === selectedId;
+                const props = {
+                    key: cons.id || i,
+                    points: cons.points,
+                    stroke: isSelected ? '#2563eb' : cons.color,
+                    strokeWidth: isSelected ? 4 : 2,
+                    dash: cons.dash,
+                    hitStrokeWidth: 10,
+                    onClick: (e) => {
                         if (tool === 'select') {
                             setSelectedId(cons.id);
                             e.cancelBubble = true;
                         }
-                    }}
-                    onMouseEnter={(e) => {
+                    },
+                    onMouseEnter: (e) => {
                         const container = e.target.getStage().container();
                         container.style.cursor = tool === 'select' ? 'pointer' : 'crosshair';
-                    }}
-                    onMouseLeave={(e) => {
+                    },
+                    onMouseLeave: (e) => {
                         const container = e.target.getStage().container();
                         container.style.cursor = 'crosshair';
-                    }}
-                />
-            ))}
+                    }
+                };
+
+                if (cons.type === 'spring') {
+                    return <ZigzagLine {...props} />;
+                }
+                if (cons.type === 'pulley') {
+                    const [x1, y1, x2, y2, x3, y3, x4, y4] = cons.points;
+                    return (
+                        <Group key={cons.id || i}>
+                            <Line {...props} />
+                            {/* Pulley Wheels at Fixed Points C and D */}
+                            <Circle x={x2} y={y2} radius={8} fill="#f3f4f6" stroke={props.stroke} strokeWidth={2} />
+                            <Circle x={x3} y={y3} radius={8} fill="#f3f4f6" stroke={props.stroke} strokeWidth={2} />
+                            {/* Hubs */}
+                            <Circle x={x2} y={y2} radius={3} fill={props.stroke} />
+                            <Circle x={x3} y={y3} radius={3} fill={props.stroke} />
+                        </Group>
+                    );
+                }
+                return <Line {...props} />;
+            })}
 
             {/* Connection Preview */}
             {connectionStart && (
@@ -454,6 +802,11 @@ const PhysicsEditor = () => {
             {tool === 'cut' && cutStart && (
                 <Line points={[cutStart.x, cutStart.y, mousePos.x, mousePos.y]} stroke="#ef4444" strokeWidth={2} dash={[4, 4]} />
             )}
+
+            {/* Snap Lines */}
+            {snapLines.map((line, i) => (
+                <Line key={`snap-${i}`} points={line} stroke="#f59e0b" strokeWidth={1} dash={[4, 4]} />
+            ))}
 
             {/* Objects */}
             {objects
@@ -475,7 +828,22 @@ const PhysicsEditor = () => {
                 x={obj.x} y={obj.y} 
                 rotation={obj.angle * (180 / Math.PI)}
                 draggable={tool === 'select'}
-                onDragEnd={(e) => handleDragEnd(e, obj.id)}
+                onDragMove={(e) => {
+                    if (tool === 'select') {
+                        const id = obj.plugin.userLabel;
+                        const x = e.target.x();
+                        const y = e.target.y();
+                        const { x: sx, y: sy, lines } = getSnapPosition(id, x, y);
+                        
+                        // Apply snapping visual feedback
+                        setSnapLines(lines);
+                        
+                        // Apply hard snapping for "magnetic" feel
+                        e.target.x(sx);
+                        e.target.y(sy);
+                    }
+                }}
+                onDragEnd={(e) => handleDragEnd(e, obj.plugin.userLabel)}
                 onMouseDown={(e) => handleObjectMouseDown(e, obj.plugin.userLabel)}
                 onClick={(e) => {
                     if (tool === 'select') {
@@ -549,6 +917,29 @@ const PhysicsEditor = () => {
                   <span className="text-xs font-mono font-medium text-gray-600">
                     OBJ: {objects.length}
                   </span>
+             </div>
+
+             {/* History & File Group */}
+             <div className="bg-white/90 backdrop-blur-md rounded-2xl shadow-xl border border-white/20 p-1.5 flex items-center gap-1">
+                  <button onClick={handleUndo} disabled={historyIndex <= 0}
+                    className={`p-3 rounded-xl transition-all ${historyIndex > 0 ? 'text-gray-600 hover:bg-gray-100' : 'text-gray-300'}`}
+                    title="撤销 (Undo)"
+                  >
+                    <Undo2 size={20} />
+                  </button>
+                  <button onClick={handleRedo} disabled={historyIndex >= history.length - 1}
+                    className={`p-3 rounded-xl transition-all ${historyIndex < history.length - 1 ? 'text-gray-600 hover:bg-gray-100' : 'text-gray-300'}`}
+                    title="重做 (Redo)"
+                  >
+                    <Redo2 size={20} />
+                  </button>
+                  <div className="w-px h-6 bg-gray-200 mx-1" />
+                  <button onClick={handleSave} className="p-3 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all" title="保存 (Save)">
+                    <Save size={20} />
+                  </button>
+                  <label htmlFor="load-file" className="p-3 rounded-xl text-gray-600 hover:bg-blue-50 hover:text-blue-600 transition-all cursor-pointer" title="加载 (Load)">
+                    <Upload size={20} />
+                  </label>
              </div>
 
              {/* View Group */}
