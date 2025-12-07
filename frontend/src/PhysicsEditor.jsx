@@ -5,7 +5,8 @@ import {
   Play, Pause, RotateCcw, Square, Circle as CircleIcon, MousePointer, 
   Move, Settings, Box, Link, ArrowRight, Triangle, ArrowDown, Minus, 
   ChevronDown, ChevronRight, Hexagon, FastForward, RotateCw, Maximize, 
-  Activity, Cone, Grid, Layers, Monitor, Scissors, Save, Upload, Undo2, Redo2, Anchor
+  Activity, Cone, Grid, Layers, Monitor, Scissors, Save, Upload, Undo2, Redo2, Anchor,
+  Tent, Disc
 } from 'lucide-react';
 import { Shape } from 'react-konva';
 import PhysicsSceneBuilder from './utils/PhysicsEngine';
@@ -504,8 +505,8 @@ const PhysicsEditor = () => {
   };
 
   const handleStageClick = (e) => {
-    const isCreationTool = ['rect', 'circle', 'ground', 'wall', 'ramp', 'polygon', 'conveyor', 'rope', 'spring', 'cone'].includes(tool);
-    if (!isCreationTool && e.target !== e.target.getStage()) return; 
+    const isCreationTool = ['rect', 'circle', 'ground', 'wall', 'ramp', 'polygon', 'conveyor', 'rope', 'spring', 'cone', 'trapezoid', 'capsule'].includes(tool);
+    if (!isCreationTool && e.target !== e.target.getStage()) return;  
 
     const stage = e.target.getStage();
     const pointer = stage.getRelativePointerPosition();
@@ -522,6 +523,8 @@ const PhysicsEditor = () => {
     else if (tool === 'conveyor') { defaultW = 150; defaultH = 20; }
     else if (tool === 'polygon') { defaultW = 60; defaultH = 60; }
     else if (tool === 'circle' || tool === 'cone') { defaultW = 50; defaultH = 50; }
+    else if (tool === 'trapezoid') { defaultW = 80; defaultH = 50; }
+    else if (tool === 'capsule') { defaultW = 50; defaultH = 100; }
 
     // Attempt object snap first
     const snapResult = getSnapPosition(null, pointer.x, pointer.y, defaultW, defaultH);
@@ -536,6 +539,23 @@ const PhysicsEditor = () => {
         y = snap(pointer.y);
     }
     
+    // Check for overlap
+    // Note: getSnapPosition returns the snapped CENTER.
+    // isRegionFree expects CENTER coordinates and DIMENSIONS.
+    // However, if we are snapping to an object edge, isRegionFree might return false if it's too tight?
+    // Usually isRegionFree should allow "touching" but not "overlapping".
+    // My implementation of isRegionFree uses strict inequalities (<, >), so touching is allowed.
+    if (!builder.isRegionFree(x, y, defaultW, defaultH)) {
+        // Option 1: Prevent creation
+        // Option 2: Show warning.
+        // User said: "不允许体积重叠创建" (Do not allow creation if volume overlaps)
+        // I will flash a warning and return.
+        console.warn('Cannot create object: Region overlaps with existing object.');
+        // Maybe show a visual indicator? For now, just return.
+        // Or maybe try to find a nearby free spot? No, simple rejection is better for now.
+        return; 
+    }
+
     // Show snap lines briefly
     if (snapResult.lines.length > 0) {
         setSnapLines(snapResult.lines);
@@ -624,6 +644,17 @@ const PhysicsEditor = () => {
     } else if (tool === 'conveyor') {
        builder.createConveyorBelt(id, { x: finalX, y: finalY, z: finalZ, width: 150, height: 20, depth: 50, speed: 5 });
        created = true;
+    } else if (tool === 'trapezoid') {
+       // Create Trapezoid
+       // We can use createBlock as base or need a new method. 
+       // PhysicsEngine updateObject handles 'Trapezoid' type, but we need createTrapezoid method or pass type manually.
+       // Let's assume we can call createBlock but override type, or better add createTrapezoid to builder.
+       // For now, I'll use generic _createBodyFromData logic by manually constructing data.
+       builder.createObject(id, { type: 'Trapezoid', x: finalX, y: finalY, z: finalZ, width: 80, height: 50, depth: 50, color: '#e67e22' });
+       created = true;
+    } else if (tool === 'capsule') {
+       builder.createObject(id, { type: 'Capsule', x: finalX, y: finalY, z: finalZ, width: 50, height: 100, depth: 50, color: '#1abc9c' });
+       created = true;
     }
     
     if (created) {
@@ -711,6 +742,8 @@ const PhysicsEditor = () => {
             <ToolButton icon={<CircleIcon />} active={tool === 'circle'} onClick={() => setTool('circle')} tooltip="圆形" />
             <ToolButton icon={<Cone />} active={tool === 'cone'} onClick={() => setTool('cone')} tooltip="圆锥" />
             <ToolButton icon={<Hexagon />} active={tool === 'polygon'} onClick={() => setTool('polygon')} tooltip="多边形" />
+            <ToolButton icon={<Tent />} active={tool === 'trapezoid'} onClick={() => setTool('trapezoid')} tooltip="梯形" />
+            <ToolButton icon={<Disc />} active={tool === 'capsule'} onClick={() => setTool('capsule')} tooltip="胶囊" />
         </CollapsibleSection>
         
         <CollapsibleSection title="环境构建">
@@ -886,7 +919,7 @@ const PhysicsEditor = () => {
                      shadowColor="black" shadowBlur={5} shadowOpacity={0.1} shadowOffset={{x:2,y:2}}
                   />
                 )}
-                {['Triangle', 'Polygon', 'Cone'].includes(obj.type) && !(obj.type === 'Cone' && viewMode === 'top') && (
+                {['Triangle', 'Incline', 'Polygon', 'Cone', 'Trapezoid', 'Capsule'].includes(obj.type) && !(obj.type === 'Cone' && viewMode === 'top') && (
                   <Line points={obj.vertices.flatMap(v => [v.x, v.y])} closed={true} fill={obj.fillStyle || '#e67e22'} stroke="rgba(0,0,0,0.2)" strokeWidth={1} 
                      shadowColor="black" shadowBlur={5} shadowOpacity={0.1} shadowOffset={{x:2,y:2}}
                   />

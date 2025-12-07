@@ -70,16 +70,28 @@ class PhysicsSceneBuilder {
             const data = this.sceneData[id];
             if (!body || !data) return;
 
+            let bodyX = body.position.x;
+            let bodyY = body.position.y;
+
+            // Correct for offset if necessary (Inverse of creation logic)
+            if (this.currentViewMode === 'side' && (data.type === 'Triangle' || data.type === 'Incline' || data.type === 'Cone' || data.type === 'Trapezoid')) {
+                 const renderW = data.width || (body.bounds.max.x - body.bounds.min.x);
+                 const renderH = data.height || (body.bounds.max.y - body.bounds.min.y);
+                 const offset = this._getCenterOffset(data.type, renderW, renderH);
+                 bodyX -= offset.x;
+                 bodyY -= offset.y;
+            }
+
             if (this.currentViewMode === 'side') {
                 // Side View: Matter(x, y) -> Data(x, y)
-                data.x = body.position.x;
-                data.y = body.position.y;
+                data.x = bodyX;
+                data.y = bodyY;
                 data.angle = body.angle;
                 // z remains unchanged
             } else {
                 // Top View: Matter(x, y) -> Data(x, z)
-                data.x = body.position.x;
-                data.z = body.position.y; // Map visual Y to Z
+                data.x = bodyX;
+                data.z = bodyY; // Map visual Y to Z
                 // y remains unchanged
                 data.angleTop = body.angle; 
             }
@@ -108,6 +120,30 @@ class PhysicsSceneBuilder {
         // Note: Constraints might need projection too. For now, focusing on bodies.
     }
 
+    _getCenterOffset(type, width, height) {
+        if (type === 'Triangle' || type === 'Incline') {
+            // For a Right Triangle (Ramp) with vertices (0,h), (w,h), (w,0)
+            // Centroid relative to BBox Center (w/2, h/2) is (w/6, h/6)
+            return { x: width / 6, y: height / 6 };
+        }
+        if (type === 'Cone') {
+            // For Cone in Side View (Isosceles Triangle)
+            // Vertices relative to center: (0, -h/2), (w/2, h/2), (-w/2, h/2)
+            // CoM relative to BBox Center (0,0) is (0, h/6)
+            return { x: 0, y: height / 6 };
+        }
+        if (type === 'Trapezoid') {
+            // Trapezoid (slope=0.5)
+            // Centroid is lower than geometric center (wider bottom)
+            // Offset Y = h^2 / (6 * (2w - h))
+            // Avoid division by zero if 2w = h (though unlikely for trapezoid)
+            const denom = 6 * (2 * width - height);
+            if (denom <= 0) return { x: 0, y: 0 };
+            return { x: 0, y: (height * height) / denom };
+        }
+        return { x: 0, y: 0 };
+    }
+
     _createBodyFromData(data) {
         let body;
         let renderX, renderY, renderW, renderH;
@@ -133,6 +169,15 @@ class PhysicsSceneBuilder {
             label: data.type,
             plugin: { userLabel: data.id }
         };
+
+        // Apply Offset for shapes where CoM != BBox Center (e.g. Triangle in Side View)
+        let offsetX = 0;
+        let offsetY = 0;
+        if (this.currentViewMode === 'side' && (data.type === 'Triangle' || data.type === 'Incline' || data.type === 'Cone' || data.type === 'Trapezoid')) {
+             const offset = this._getCenterOffset(data.type, renderW, renderH);
+             offsetX = offset.x;
+             offsetY = offset.y;
+        }
 
         if (data.type === 'Rectangle' || data.type === 'Box' || data.type === 'Ground' || data.type === 'Wall' || data.type === 'Conveyor') {
             body = Bodies.rectangle(renderX, renderY, renderW, renderH, commonOptions);
@@ -163,22 +208,54 @@ class PhysicsSceneBuilder {
             // Let's assume "Circle" is a Sphere.
             body = Bodies.circle(renderX, renderY, data.radius, commonOptions);
             body.radius = data.radius;
-        } else if (data.type === 'Triangle') {
+        } else if (data.type === 'Triangle' || data.type === 'Incline') {
              // Triangle (Ramp)
              // Side View: Triangle. Top View: Rectangle (Slope from top).
              if (this.currentViewMode === 'side') {
+                // Ramp: Bottom-Left to Top-Right
+                // Vertices order: Bottom-Left (0, h), Bottom-Right (w, h), Top-Right (w, 0)
+                // This creates a ramp going UP to the RIGHT.
                 const vertices = [
-                    { x: 0, y: 0 },
-                    { x: renderW, y: 0 },
-                    { x: 0, y: renderH }
+                    { x: 0, y: renderH },
+                    { x: renderW, y: renderH },
+                    { x: renderW, y: 0 }
                 ];
-                body = Bodies.fromVertices(renderX, renderY, [vertices], commonOptions);
+                
+                // Apply offset to body position so that the bounding box center aligns with renderX, renderY
+                // renderX, renderY is where we want the center of the bounding box to be.
+                // body.position will be set to (renderX + offsetX, renderY + offsetY)
+                body = Bodies.fromVertices(renderX + offsetX, renderY + offsetY, [vertices], commonOptions);
              } else {
                  // Top View of a Ramp is a Rectangle
                  body = Bodies.rectangle(renderX, renderY, renderW, renderH, commonOptions);
                  body.width = renderW;
                  body.height = renderH;
              }
+        } else if (data.type === 'Trapezoid') {
+            // Trapezoid
+            if (this.currentViewMode === 'side') {
+                 // Bodies.trapezoid(x, y, width, height, slope, [options])
+                 // slope < 1. 0.5 means 45 degrees usually.
+                 body = Bodies.trapezoid(renderX, renderY, renderW, renderH, 0.5, commonOptions);
+            } else {
+                 // Top View of Trapezoid Prism is Rectangle
+                 body = Bodies.rectangle(renderX, renderY, renderW, renderH, commonOptions);
+                 body.width = renderW;
+                 body.height = renderH;
+            }
+        } else if (data.type === 'Capsule') {
+             // Capsule
+             // Matter.js doesn't have direct Capsule, but we can make a rectangle with chamfer
+             // Chamfer radius = height/2 (or width/2 depending on orientation)
+             const radius = Math.min(renderW, renderH) / 2;
+             const chamfer = { radius: [radius, radius, radius, radius] };
+             
+             // Merge options
+             const options = { ...commonOptions, chamfer };
+             
+             body = Bodies.rectangle(renderX, renderY, renderW, renderH, options);
+             body.width = renderW;
+             body.height = renderH;
         } else if (data.type === 'Polygon') {
             // Polygon
             // Side View: Polygon. Top View: Polygon (Prism from top).
@@ -250,6 +327,14 @@ class PhysicsSceneBuilder {
                 targetY = data.z;
                 if (updates.angleTop !== undefined) Body.setAngle(body, updates.angleTop);
             }
+
+            // Apply Offset to target Position
+            if (this.currentViewMode === 'side' && (data.type === 'Triangle' || data.type === 'Incline' || data.type === 'Cone' || data.type === 'Trapezoid')) {
+                const offset = this._getCenterOffset(data.type, data.width, data.height);
+                targetX += offset.x;
+                targetY += offset.y;
+            }
+
             Body.setPosition(body, { x: targetX, y: targetY });
 
             // Dimensions (Re-creating body might be needed if dimensions change, 
@@ -293,99 +378,60 @@ class PhysicsSceneBuilder {
         }
     }
 
-    /**
-     * 创建基础矩形物体
-     */
-    createBlock(id, params) {
-        const { x, y, width, height, depth = 50, z = this.height / 2, color = '#3498db', isStatic = false, friction = 0.5, mass, angle = 0, label = 'Rectangle' } = params;
-        
-        const data = {
-            id, type: label,
-            x, y, z,
-            width, height, depth,
-            color, isStatic, friction, mass, angle,
-            angleTop: 0
-        };
-        this.sceneData[id] = data;
-        this._createBodyFromData(data);
+    createObject(id, data) {
+        this.sceneData[id] = { ...data, id };
+        this._createBodyFromData(this.sceneData[id]);
     }
 
     /**
-     * 创建圆形物体
+     * 创建通用矩形块
      */
-    createBall(id, params) {
-        const { x, y, radius, z = this.height / 2, color = '#e74c3c', isStatic = false, friction = 0.1, restitution = 0.8, mass } = params;
-        
-        const data = {
-            id, type: 'Circle',
-            x, y, z,
-            radius,
-            color, isStatic, friction, restitution, mass,
-            angle: 0, angleTop: 0
-        };
-        this.sceneData[id] = data;
-        this._createBodyFromData(data);
+    createBlock(id, { x, y, z, width, height, depth, color = '#3498db', isStatic = false, label = 'Box' }) {
+        this.createObject(id, {
+            type: label === 'Ground' || label === 'Wall' ? label : 'Box',
+            x, y, z, width, height, depth, color, isStatic
+        });
     }
 
     /**
-     * 创建直角三角形 (斜面)
+     * 创建球体
      */
-    createRightTriangle(id, params) {
-        this.createIncline(id, params);
+    createBall(id, { x, y, z, radius, color = '#e74c3c' }) {
+        this.createObject(id, {
+            type: 'Circle',
+            x, y, z, radius, color, width: radius * 2, height: radius * 2, depth: radius * 2
+        });
     }
 
     /**
-     * 创建斜面 (Incline)
+     * 创建圆锥
      */
-    createIncline(id, params) {
-        const { x, y, width, height, depth = 100, z = this.height / 2, color = '#e67e22', isStatic = true, friction = 0.5, angle = 0 } = params;
-        
-        const data = {
-            id, type: 'Triangle',
-            x, y, z,
-            width, height, depth,
-            color, isStatic, friction, angle,
-            angleTop: 0
-        };
-        this.sceneData[id] = data;
-        this._createBodyFromData(data);
+    createCone(id, { x, y, z, radius, height, color = '#f1c40f' }) {
+        this.createObject(id, {
+            type: 'Cone',
+            x, y, z, radius, height, color, width: radius * 2, depth: radius * 2
+        });
     }
 
     /**
-     * 创建圆锥体 (Cone)
+     * 创建斜面
      */
-    createCone(id, params) {
-        const { x, y, radius, height, z = this.height / 2, color = '#f1c40f', isStatic = false, friction = 0.5, mass } = params;
-        
-        const data = {
-            id, type: 'Cone',
-            x, y, z,
-            radius, height, // Height in 3D (Y-axis usually, but here height might be depth in top view?)
-            // Let's assume Height is the vertical height of the cone.
-            // In Side View: Triangle (width=2*radius, height=height)
-            // In Top View: Circle (radius=radius)
-            color, isStatic, friction, mass,
-            angle: 0, angleTop: 0
-        };
-        this.sceneData[id] = data;
-        this._createBodyFromData(data);
+    createIncline(id, { x, y, z, width, height, depth, color = '#95a5a6' }) {
+        this.createObject(id, {
+            type: 'Incline',
+            x, y, z, width, height, depth, color, isStatic: true // Ramps usually static? Or not. Let's default to static if it's "Ramp" tool, but user might want dynamic.
+            // Actually PhysicsEditor doesn't pass isStatic for ramp. Let's default false unless specified.
+        });
     }
 
     /**
-     * 创建多边形 (Regular Polygon)
+     * 创建多边形
      */
-    createPolygon(id, params) {
-        const { x, y, sides = 5, radius = 25, z = this.height / 2, color = '#9b59b6', isStatic = false, friction = 0.5, mass, angle = 0 } = params;
-        
-        const data = {
-            id, type: 'Polygon',
-            x, y, z,
-            sides, radius,
-            color, isStatic, friction, mass, angle,
-            angleTop: 0
-        };
-        this.sceneData[id] = data;
-        this._createBodyFromData(data);
+    createPolygon(id, { x, y, z, sides, radius, color = '#9b59b6' }) {
+        this.createObject(id, {
+            type: 'Polygon',
+            x, y, z, sides, radius, color, width: radius * 2, height: radius * 2, depth: radius * 2 // approx
+        });
     }
 
     /**
@@ -649,24 +695,14 @@ class PhysicsSceneBuilder {
         return null;
     }
 
-    createConveyorBelt(id, params) {
-        const { x, y, width, height, depth = 50, z = this.height / 2, speed = 5, friction = 0.8 } = params;
-         const data = {
-            id, type: 'Conveyor',
-            x, y, z,
-            width, height, depth,
-            color: '#34495e', isStatic: true, friction, 
-            conveyorSpeed: speed,
-            angle: 0
-        };
-        this.sceneData[id] = data;
-        this._createBodyFromData(data);
-        
-        // 注册碰撞事件
-        if (!this.hasRegisteredCollision) {
-            this._registerCollisionEvents();
-            this.hasRegisteredCollision = true;
-        }
+    /**
+     * 创建传送带
+     */
+    createConveyorBelt(id, { x, y, z, width, height, depth, speed, color = '#2c3e50' }) {
+        this.createObject(id, {
+            type: 'Conveyor',
+            x, y, z, width, height, depth, color, isStatic: true, speed
+        });
     }
     
     _registerCollisionEvents() {
@@ -678,6 +714,42 @@ class PhysicsSceneBuilder {
     /**
      * 内部方法：注册自定义物理更新逻辑
      */
+    isRegionFree(x, y, width, height, excludeId = null) {
+        // Simple AABB check against sceneData
+        // (x, y) is the center of the new object
+        const halfW = width / 2;
+        const halfH = height / 2;
+        const minX = x - halfW;
+        const maxX = x + halfW;
+        const minY = y - halfH;
+        const maxY = y + halfH;
+
+        for (const id in this.sceneData) {
+            if (id === excludeId) continue;
+            const obj = this.sceneData[id];
+            
+            // Get obj bounds in current view
+            // Note: For now we only check current view collision, which is what matters for user feedback
+            let objX = obj.x;
+            let objY = this.currentViewMode === 'side' ? obj.y : obj.z;
+            let objW = obj.width || (obj.radius * 2) || 50;
+            let objH = (this.currentViewMode === 'side' ? obj.height : obj.depth) || (obj.radius * 2) || 50;
+
+            const oHalfW = objW / 2;
+            const oHalfH = objH / 2;
+            const oMinX = objX - oHalfW;
+            const oMaxX = objX + oHalfW;
+            const oMinY = objY - oHalfH;
+            const oMaxY = objY + oHalfH;
+
+            // AABB Overlap Check
+            if (minX < oMaxX && maxX > oMinX && minY < oMaxY && maxY > oMinY) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     _registerCustomUpdate() {
         if (this.hasRegisteredEvents) return;
 
